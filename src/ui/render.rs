@@ -433,7 +433,15 @@ impl App {
             vec![Span::styled(" ", Style::default())]
         };
 
-        let content: Vec<Span> = if let Some(msg) = &self.ui.status {
+        let content: Vec<Span> = if self.ui.syncing {
+            vec![
+                Span::styled(" ", Style::default()),
+                Span::styled(
+                    "⟳ Syncing with FreshRSS… You can keep reading.",
+                    Style::default().fg(accent).bold(),
+                ),
+            ]
+        } else if let Some(msg) = &self.ui.status {
             vec![
                 Span::styled(" ", Style::default()),
                 Span::styled(format!("{DOG_ICON} {msg}"), Style::default().fg(accent)),

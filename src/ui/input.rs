@@ -131,35 +131,24 @@ impl App {
 
             // Actions
             KeyCode::Char('r') => {
-                self.ui.set_status("Refreshing feeds...");
-                let refreshed = if self.ui.sync_enabled {
-                    self.ui.syncing = true;
-                    let result = self.run_sync().await;
-                    self.ui.syncing = false;
-                    result
-                } else {
-                    self.feeds.refresh_all().await;
-                    Ok(())
-                };
-                match refreshed {
-                    Ok(()) => {
-                        self.ui.read_this_session.clear();
-                        self.ui.set_status("Feeds refreshed!");
+                if self.ui.sync_enabled {
+                    if let Err(error) = self.start_sync() {
+                        self.ui.set_error(format!("Refresh failed: {error}"));
                     }
-                    Err(error) => self.ui.set_error(format!("Refresh failed: {error}")),
+                } else {
+                    self.ui.set_status("Refreshing feeds...");
+                    self.feeds.refresh_all().await;
+                    self.ui.read_this_session.clear();
+                    self.ui.set_status("Feeds refreshed!");
                 }
             }
             KeyCode::Char('o') => self.open_link(),
             KeyCode::Char('s') => self.open_share_dialog(),
             KeyCode::Char('S') => {
                 if self.ui.sync_enabled && !self.ui.syncing {
-                    self.ui.syncing = true;
-                    self.ui.set_status("⟳ Syncing...");
-                    match self.run_sync().await {
-                        Ok(()) => {}
-                        Err(e) => self.ui.set_error(format!("Sync failed: {e}")),
+                    if let Err(error) = self.start_sync() {
+                        self.ui.set_error(format!("Sync failed: {error}"));
                     }
-                    self.ui.syncing = false;
                 } else if !self.ui.sync_enabled {
                     self.ui
                         .set_error("No sync configured. Run 'feedo sync login' first.");
@@ -543,7 +532,7 @@ impl App {
         }
 
         if self.ui.sync_enabled {
-            if let Err(error) = self.run_sync().await {
+            if let Err(error) = self.start_sync() {
                 self.ui
                     .set_error(format!("Failed to sync new feed: {error}"));
                 return;
