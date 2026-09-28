@@ -6,12 +6,50 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use color_eyre::Result;
 use tracing::{debug, info};
 
 use crate::config::{Config, FeedConfig, FolderConfig};
-use crate::feed::FeedCache;
-use crate::sync::{AuthToken, GReaderClient, StreamOptions};
+use crate::feed::{CachedItem, FeedCache};
+use crate::sync::{AuthToken, GReaderClient, StreamItem, StreamOptions};
+
+/// Match a server item to the locally cached RSS item.
+///
+/// `FreshRSS` may expose a canonical URL that differs from the URL in the RSS
+/// feed, so first compare every canonical/alternate URL and then fall back to
+/// title plus publication time.
+fn find_local_item<'a>(
+    items: &'a [CachedItem],
+    server_item: &StreamItem,
+) -> Option<&'a CachedItem> {
+    for link in server_item.links() {
+        let id = CachedItem::generate_id(Some(link), server_item.title.as_deref().unwrap_or(""));
+        if let Some(item) = items.iter().find(|item| item.id == id) {
+            return Some(item);
+        }
+    }
+
+    let title = server_item.title.as_deref()?.trim();
+    let mut title_matches = items.iter().filter(|item| item.title.trim() == title);
+    let first = title_matches.next()?;
+    let Some(second) = title_matches.next() else {
+        return Some(first);
+    };
+
+    // Duplicate titles are uncommon within one feed. If present, use the
+    // closest publication time to disambiguate, otherwise retain the first.
+    let published = server_item.published_at()?;
+    std::iter::once(first)
+        .chain(std::iter::once(second))
+        .chain(title_matches)
+        .filter_map(|item| {
+            item.published
+                .map(|local| ((local.timestamp() - published.timestamp()).abs(), item))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, item)| item)
+}
 
 /// Result of a sync operation.
 #[derive(Debug, Default)]
@@ -163,6 +201,8 @@ impl SyncManager {
     /// Sync read states from server to local cache.
     pub async fn sync_read_states_from_server(&self, cache: &mut FeedCache) -> Result<SyncResult> {
         let mut result = SyncResult::default();
+        let pending_states: HashMap<String, bool> =
+            cache.pending_read_states()?.into_iter().collect();
 
         // Get subscriptions to map feed IDs to URLs
         let subs = self.client.subscriptions(&self.auth).await?;
@@ -184,33 +224,93 @@ impl SyncManager {
                 }
             };
 
-            for item in &items.items {
-                // Check if this item is read on server (has "read" category)
-                let is_read_on_server = item
-                    .categories
-                    .iter()
-                    .any(|c| c.contains("/state/com.google/read"));
-
-                if is_read_on_server {
-                    // Mark as read locally using link+title to generate ID
-                    if let Some(link) = item.link() {
-                        let local_id = crate::feed::CachedItem::generate_id(
-                            Some(link),
-                            item.title.as_deref().unwrap_or(""),
-                        );
-                        // Check if already read locally
-                        let already_read = cache
-                            .get(&sub.url)
-                            .and_then(|f| f.items.iter().find(|i| i.id == local_id))
-                            .map_or(false, |i| i.read);
-
-                        if !already_read {
-                            cache.set_item_read(&sub.url, &local_id, true);
-                            result.items_marked_read += 1;
-                        }
-                    }
+            // FreshRSS may include the read category on every item returned by
+            // an unfiltered stream. Its `xt=read` filtered stream is the
+            // authoritative source for unread membership.
+            let unread_items = match self
+                .client
+                .stream_contents(
+                    &self.auth,
+                    &sub.id,
+                    Some(StreamOptions::unread_with_count(100)),
+                )
+                .await
+            {
+                Ok(items) => items,
+                Err(error) => {
+                    result.errors.push(format!(
+                        "Failed to fetch unread status for {}: {error}",
+                        sub.title
+                    ));
+                    continue;
                 }
+            };
+            let unread_ids: HashSet<&str> = unread_items
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect();
+
+            // Keep every unread item in the local 100-item window, then fill
+            // remaining slots with the newest read items.
+            let mut account_items: Vec<&StreamItem> = unread_items.items.iter().collect();
+            let remaining = 100usize.saturating_sub(account_items.len());
+            account_items.extend(
+                items
+                    .items
+                    .iter()
+                    .filter(|item| !unread_ids.contains(item.id.as_str()))
+                    .take(remaining),
+            );
+
+            let existing = cache
+                .get(&sub.url)
+                .map(|feed| feed.items.clone())
+                .unwrap_or_default();
+            let mut synced_items = Vec::with_capacity(account_items.len());
+
+            for item in account_items {
+                let local_match = find_local_item(&existing, item);
+                let is_read_on_server = !unread_ids.contains(item.id.as_str());
+
+                if is_read_on_server && local_match.is_some_and(|local| !local.read) {
+                    result.items_marked_read += 1;
+                }
+
+                let title = item.title.clone().unwrap_or_else(|| "Untitled".to_string());
+                let link = local_match
+                    .and_then(|local| local.link.clone())
+                    .or_else(|| item.links().next().map(str::to_string));
+                let id = local_match.map_or_else(
+                    || CachedItem::generate_id(link.as_deref(), &title),
+                    |local| local.id.clone(),
+                );
+                synced_items.push(CachedItem {
+                    id,
+                    sync_id: Some(item.id.clone()),
+                    title,
+                    link,
+                    published: local_match
+                        .and_then(|local| local.published)
+                        .or_else(|| item.published_at()),
+                    summary: item.get_content().map(str::to_string),
+                    // A pending local action wins until acknowledged. Without
+                    // one, the account server is authoritative.
+                    read: pending_states
+                        .get(&item.id)
+                        .copied()
+                        .unwrap_or(is_read_on_server),
+                    cached_at: local_match.map_or_else(Utc::now, |local| local.cached_at),
+                });
             }
+
+            debug!(
+                "Account refresh for {}: {} articles, {} unread after local overlay",
+                sub.title,
+                synced_items.len(),
+                synced_items.iter().filter(|item| !item.read).count()
+            );
+            cache.replace_synced_feed(&sub.url, &sub.title, synced_items);
         }
 
         info!(
@@ -221,93 +321,35 @@ impl SyncManager {
     }
 
     /// Sync local read states to server.
-    pub async fn sync_read_states_to_server(
-        &self,
-        cache: &FeedCache,
-        config: &Config,
-    ) -> Result<SyncResult> {
+    pub async fn sync_read_states_to_server(&self, cache: &mut FeedCache) -> Result<SyncResult> {
         let mut result = SyncResult::default();
 
-        // Get all feed URLs from config
-        let feed_urls: Vec<String> = config
-            .folders
-            .iter()
-            .flat_map(|f| f.feeds.iter().map(|feed| feed.url.clone()))
-            .chain(config.feeds.iter().map(|f| f.url.clone()))
-            .collect();
-
-        // Get subscriptions to map URLs to feed IDs
-        let subs = self.client.subscriptions(&self.auth).await?;
-        let url_to_feed_id: HashMap<String, String> =
-            subs.iter().map(|s| (s.url.clone(), s.id.clone())).collect();
-
-        // For each local feed, sync read items
-        for feed_url in &feed_urls {
-            let Some(cached_feed) = cache.get(feed_url) else {
+        // Send the durable status queue first. This makes local user actions
+        // authoritative until the server has acknowledged them.
+        let pending = cache.pending_read_states()?;
+        for read in [true, false] {
+            let ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, state)| *state == read)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if ids.is_empty() {
                 continue;
-            };
-
-            let Some(feed_id) = url_to_feed_id.get(feed_url) else {
-                debug!("Feed {} not found on server, skipping", feed_url);
-                continue;
-            };
-
-            // Get items from server for this feed
-            let server_items = match self
-                .client
-                .stream_contents(&self.auth, feed_id, Some(StreamOptions::with_count(100)))
-                .await
-            {
-                Ok(items) => items,
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to fetch {}: {}", feed_url, e));
-                    continue;
-                }
-            };
-
-            // Find items that are read locally but not on server
-            let mut to_mark_read: Vec<String> = Vec::new();
-
-            for server_item in &server_items.items {
-                if server_item.is_read() {
-                    continue; // Already read on server
-                }
-
-                // Check if read locally
-                if let Some(link) = server_item.link() {
-                    let local_id = crate::feed::CachedItem::generate_id(
-                        Some(link),
-                        server_item.title.as_deref().unwrap_or(""),
-                    );
-
-                    if let Some(local_item) = cached_feed.items.iter().find(|i| i.id == local_id) {
-                        if local_item.read {
-                            to_mark_read.push(server_item.id.clone());
-                        }
-                    }
-                }
             }
-
-            // Mark items as read on server
-            if !to_mark_read.is_empty() {
-                let ids: Vec<&str> = to_mark_read.iter().map(|s| s.as_str()).collect();
-                match self.client.mark_read(&self.auth, &ids).await {
-                    Ok(()) => {
-                        result.items_synced_to_server += to_mark_read.len();
-                        info!(
-                            "Marked {} items as read on server for {}",
-                            to_mark_read.len(),
-                            feed_url
-                        );
-                    }
-                    Err(e) => {
-                        result
-                            .errors
-                            .push(format!("Failed to mark read on server: {}", e));
-                    }
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let upload = if read {
+                self.client.mark_read(&self.auth, &refs).await
+            } else {
+                self.client.mark_unread(&self.auth, &refs).await
+            };
+            match upload {
+                Ok(()) => {
+                    cache.acknowledge_read_states(&ids)?;
+                    result.items_synced_to_server += ids.len();
                 }
+                Err(error) => result
+                    .errors
+                    .push(format!("Failed to upload queued read states: {error}")),
             }
         }
 
@@ -330,18 +372,72 @@ impl SyncManager {
         result.feeds_existing = import_result.feeds_existing;
         result.errors.extend(import_result.errors);
 
-        // 2. Sync read states from server to local
-        info!("Step 2: Syncing read states from server...");
+        // 2. Download articles while overlaying durable local status changes.
+        // Reader API servers may briefly return stale state after a write, so
+        // pending local changes must be applied before they are acknowledged.
+        info!("Step 2: Syncing articles and read states from server...");
         let from_server = self.sync_read_states_from_server(cache).await?;
         result.items_marked_read = from_server.items_marked_read;
         result.errors.extend(from_server.errors);
 
-        // 3. Sync local read states to server
+        // 3. Upload and acknowledge the durable local status queue.
         info!("Step 3: Syncing read states to server...");
-        let to_server = self.sync_read_states_to_server(cache, config).await?;
+        let to_server = self.sync_read_states_to_server(cache).await?;
         result.items_synced_to_server = to_server.items_synced_to_server;
         result.errors.extend(to_server.errors);
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+
+    use super::find_local_item;
+    use crate::feed::CachedItem;
+    use crate::sync::StreamItem;
+
+    fn cached_item(title: &str, link: &str, published: i64) -> CachedItem {
+        CachedItem {
+            id: CachedItem::generate_id(Some(link), title),
+            sync_id: None,
+            title: title.to_string(),
+            link: Some(link.to_string()),
+            published: Utc.timestamp_opt(published, 0).single(),
+            summary: None,
+            read: true,
+            cached_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn matches_any_server_link() {
+        let local = cached_item("Article", "https://example.com/from-feed", 100);
+        let server: StreamItem = serde_json::from_value(json!({
+            "id": "server-id",
+            "title": "Article",
+            "published": 100,
+            "canonical": [{"href": "https://example.com/canonical"}],
+            "alternate": [{"href": "https://example.com/from-feed"}]
+        }))
+        .unwrap();
+
+        assert_eq!(find_local_item(&[local], &server).unwrap().title, "Article");
+    }
+
+    #[test]
+    fn unique_title_matches_despite_different_timestamp() {
+        let local = cached_item("Article", "https://feed.example/article", 100);
+        let server: StreamItem = serde_json::from_value(json!({
+            "id": "server-id",
+            "title": "Article",
+            "published": 999,
+            "canonical": [{"href": "https://canonical.example/article"}]
+        }))
+        .unwrap();
+
+        assert_eq!(find_local_item(&[local], &server).unwrap().title, "Article");
     }
 }

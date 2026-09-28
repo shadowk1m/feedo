@@ -192,16 +192,20 @@ impl FeedManager {
 
         debug!("Fetching feed: {name} ({url})");
 
-        // Get current read states to preserve
-        let read_states: HashMap<String, bool> =
-            feed.items.iter().map(|i| (i.id.clone(), i.read)).collect();
+        // Preserve local state and server IDs across ordinary RSS refreshes.
+        let item_states: HashMap<String, (bool, Option<String>)> = feed
+            .items
+            .iter()
+            .map(|item| (item.id.clone(), (item.read, item.sync_id.clone())))
+            .collect();
 
         match self.fetch_feed(&url).await {
             Ok(mut items) => {
                 // Restore read states from memory
                 for item in &mut items {
-                    if let Some(&was_read) = read_states.get(&item.id) {
-                        item.read = was_read;
+                    if let Some((was_read, sync_id)) = item_states.get(&item.id) {
+                        item.read = *was_read;
+                        item.sync_id.clone_from(sync_id);
                     }
                 }
 
@@ -210,6 +214,7 @@ impl FeedManager {
                     .iter()
                     .map(|i| CachedItem {
                         id: i.id.clone(),
+                        sync_id: i.sync_id.clone(),
                         title: i.title.clone(),
                         link: i.link.clone(),
                         published: i.published,
@@ -299,6 +304,7 @@ impl FeedManager {
                 .iter()
                 .map(|i| CachedItem {
                     id: i.id.clone(),
+                    sync_id: i.sync_id.clone(),
                     title: i.title.clone(),
                     link: i.link.clone(),
                     published: i.published,
@@ -330,6 +336,7 @@ fn cached_to_items(cached: &[CachedItem]) -> Vec<FeedItem> {
         .iter()
         .map(|c| FeedItem {
             id: c.id.clone(),
+            sync_id: c.sync_id.clone(),
             title: c.title.clone(),
             link: c.link.clone(),
             published: c.published,

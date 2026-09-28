@@ -6,7 +6,7 @@ use std::io::{self, stdout};
 
 use color_eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -31,6 +31,12 @@ pub struct App {
 
     /// Theme configuration.
     pub theme: Theme,
+
+    /// Reused connection for automatic read-state uploads.
+    sync_manager: Option<crate::sync::SyncManager>,
+
+    /// Earliest time a failed automatic upload should be retried.
+    read_sync_retry_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -39,7 +45,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if configuration cannot be loaded or feeds cannot be initialized.
-    pub async fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let config = Config::load()?;
         let theme = config.theme;
         let sync_enabled = config.sync.is_some();
@@ -57,6 +63,7 @@ impl App {
 
         let ui = UiState {
             sync_enabled,
+            pending_sync: sync_enabled,
             // Mark that we need to refresh feeds
             refreshing: !has_cached,
             ..Default::default()
@@ -67,6 +74,8 @@ impl App {
             feeds,
             ui,
             theme,
+            sync_manager: None,
+            read_sync_retry_at: None,
         };
 
         // Build initial feed list
@@ -85,7 +94,7 @@ impl App {
         // Setup terminal
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -97,7 +106,11 @@ impl App {
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
 
         result
     }
@@ -110,7 +123,9 @@ impl App {
         use std::time::Duration;
 
         // Track if we need initial refresh
-        let mut needs_initial_refresh = self.ui.refreshing;
+        // Synced accounts get all articles from their account server. Direct
+        // RSS fetching is reserved for local-only accounts.
+        let mut needs_initial_refresh = self.ui.refreshing && !self.ui.sync_enabled;
         let mut update_check_done = false;
 
         loop {
@@ -126,16 +141,28 @@ impl App {
 
             // Use poll with timeout to allow background work
             if poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match self.handle_key(key.code).await {
-                            crate::ui::input::KeyResult::Quit => break,
-                            crate::ui::input::KeyResult::Continue => {}
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            match self.handle_key(key.code).await {
+                                crate::ui::input::KeyResult::Quit => break,
+                                crate::ui::input::KeyResult::Continue => {}
+                            }
+                            // Mark current item read whenever content is visible
+                            if self.ui.show_content {
+                                self.mark_current_read();
+                            }
                         }
                     }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
+                    }
+                    _ => {}
                 }
             } else {
                 // No input - do background work
+
+                self.sync_pending_read_items().await;
 
                 // Initial refresh (one feed at a time to stay responsive)
                 if needs_initial_refresh {
@@ -152,6 +179,18 @@ impl App {
                         self.ui.refreshing = false;
                         self.feeds.save_cache();
                     }
+                }
+
+                // A sync account is the source of truth for article history.
+                // Run its initial refresh once the local feed refresh finishes.
+                if !needs_initial_refresh && self.ui.pending_sync {
+                    self.ui.pending_sync = false;
+                    self.ui.syncing = true;
+                    if let Err(error) = self.run_sync().await {
+                        self.ui.set_error(format!("Initial sync failed: {error}"));
+                    }
+                    self.ui.syncing = false;
+                    self.ui.refreshing = false;
                 }
 
                 // Check for updates in background (once)
@@ -183,6 +222,80 @@ impl App {
             }
         }
         self.ui.mode = crate::ui::Mode::Normal;
+    }
+
+    /// Upload locally read items to the configured sync server in one batch.
+    async fn sync_pending_read_items(&mut self) {
+        if !self.ui.sync_enabled {
+            return;
+        }
+        let pending = match self.feeds.cache.pending_read_states() {
+            Ok(pending) if !pending.is_empty() => pending,
+            Ok(_) => return,
+            Err(error) => {
+                self.ui
+                    .set_error(format!("Could not load pending sync changes: {error}"));
+                return;
+            }
+        };
+        if self
+            .read_sync_retry_at
+            .is_some_and(|retry_at| std::time::Instant::now() < retry_at)
+        {
+            return;
+        }
+
+        if self.sync_manager.is_none() {
+            let Some(sync) = self.config.sync.clone() else {
+                return;
+            };
+            let Some((username, password)) = sync.get_credentials() else {
+                return;
+            };
+            match crate::sync::SyncManager::connect(&sync.server, &username, &password).await {
+                Ok(manager) => self.sync_manager = Some(manager),
+                Err(error) => {
+                    self.ui.set_error(format!("Read sync failed: {error}"));
+                    self.read_sync_retry_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                    return;
+                }
+            }
+        }
+
+        let manager = self
+            .sync_manager
+            .as_ref()
+            .expect("sync manager initialized");
+        for read in [true, false] {
+            let ids: Vec<String> = pending
+                .iter()
+                .filter(|(_, state)| *state == read)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let result = if read {
+                manager.client().mark_read(manager.auth(), &id_refs).await
+            } else {
+                manager.client().mark_unread(manager.auth(), &id_refs).await
+            };
+            if let Err(error) = result {
+                self.ui.set_error(format!("Read sync failed: {error}"));
+                self.sync_manager = None;
+                self.read_sync_retry_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30));
+                return;
+            }
+            if let Err(error) = self.feeds.cache.acknowledge_read_states(&ids) {
+                self.ui
+                    .set_error(format!("Could not finish read sync: {error}"));
+                return;
+            }
+        }
+        self.read_sync_retry_at = None;
     }
 
     /// Rebuild the flattened feed list for the UI.
@@ -241,13 +354,31 @@ impl App {
             .map_or(&[], |f| f.items.as_slice())
     }
 
+    /// Get visible items from the currently selected feed, filtered by `hide_read`.
+    ///
+    /// Returns `(raw_index, &FeedItem)` pairs so callers can map back to the
+    /// underlying `feed.items` vec for mutations.
+    ///
+    /// Items marked read during this session are kept visible until the feed is
+    /// refreshed, so they don't disappear immediately after being read.
+    #[must_use]
+    pub fn visible_items(&self) -> Vec<(usize, &FeedItem)> {
+        self.current_feed_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                !self.ui.hide_read || !item.read || self.ui.read_this_session.contains(&item.id)
+            })
+            .collect()
+    }
+
     /// Get the currently selected item.
     #[must_use]
     pub fn selected_item(&self) -> Option<&FeedItem> {
-        self.ui
-            .selected_feed
-            .and_then(|idx| self.feeds.feeds.get(idx))
-            .and_then(|f| f.items.get(self.ui.selected_item))
+        self.visible_items()
+            .into_iter()
+            .nth(self.ui.selected_item)
+            .map(|(_, item)| item)
     }
 
     /// Run sync with configured server.
@@ -278,12 +409,9 @@ impl App {
         self.config.save()?;
         self.feeds.save_cache();
 
-        // Reload feeds if new subscriptions were imported
-        if result.feeds_imported > 0 {
-            self.feeds = crate::feed::FeedManager::new(&self.config)?;
-            self.feeds.refresh_all().await;
-            self.rebuild_feed_list();
-        }
+        // Reload the 100-item FreshRSS history written to the cache.
+        self.feeds = crate::feed::FeedManager::new(&self.config)?;
+        self.rebuild_feed_list();
 
         self.ui.set_status(format!(
             "✓ Sync complete: +{} feeds, {} read",

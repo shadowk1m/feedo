@@ -1,7 +1,7 @@
 //! UI state management.
 
 use crate::feed::DiscoveredFeed;
-use ratatui::widgets::ListState;
+use ratatui::{layout::Rect, widgets::ListState};
 
 /// Active panel in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,6 +90,20 @@ pub struct UiState {
 
     /// Whether content panel is visible.
     pub show_content: bool,
+
+    /// Last rendered areas for each panel (for mouse hit-testing).
+    pub feeds_area: Rect,
+    /// Last rendered article-list area.
+    pub items_area: Rect,
+    /// Last rendered article-content area.
+    pub content_area: Rect,
+
+    /// Whether to hide read items in the items panel.
+    pub hide_read: bool,
+
+    /// Raw indices of items that were marked read during this session and should
+    /// remain visible in hide-read mode until the feed is refreshed.
+    pub read_this_session: std::collections::HashSet<String>,
 
     /// Content scroll offset.
     pub scroll_offset: u16,
@@ -238,6 +252,11 @@ impl Default for UiState {
             selected_item: 0,
             items_list_state: ListState::default(),
             show_content: false,
+            feeds_area: Rect::default(),
+            items_area: Rect::default(),
+            content_area: Rect::default(),
+            hide_read: true,
+            read_this_session: std::collections::HashSet::new(),
             scroll_offset: 0,
             search_query: String::new(),
             search_results: Vec::new(),

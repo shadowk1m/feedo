@@ -54,7 +54,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> color_eyre::Result<()> {
-//!     let mut app = App::new().await?;
+//!     let mut app = App::new()?;
 //!     app.run().await
 //! }
 //! ```

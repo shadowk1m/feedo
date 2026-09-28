@@ -195,6 +195,15 @@ impl StreamItem {
             .map(|l| l.href.as_str())
     }
 
+    /// Iterate over every URL FreshRSS exposes for this item.
+    pub fn links(&self) -> impl Iterator<Item = &str> {
+        self.canonical
+            .iter()
+            .flatten()
+            .chain(self.alternate.iter().flatten())
+            .map(|link| link.href.as_str())
+    }
+
     /// Get content (prefers full content over summary).
     pub fn get_content(&self) -> Option<&str> {
         self.content

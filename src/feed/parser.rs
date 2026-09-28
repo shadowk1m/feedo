@@ -32,6 +32,7 @@ pub fn parse_feed(bytes: &[u8]) -> Result<Vec<FeedItem>> {
 
             FeedItem {
                 id,
+                sync_id: None,
                 title,
                 link,
                 published,

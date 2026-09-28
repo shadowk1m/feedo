@@ -1,6 +1,6 @@
 //! Input handling.
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::app::App;
 use crate::config::FeedConfig;
@@ -51,7 +51,13 @@ impl App {
                     self.ui.search_results.get(self.ui.search_selected)
                 {
                     self.ui.selected_feed = Some(feed_idx);
-                    self.ui.selected_item = item_idx;
+                    // Map raw item_idx to visible index (respects hide_read filter)
+                    let visible_idx = self
+                        .visible_items()
+                        .into_iter()
+                        .position(|(raw_idx, _)| raw_idx == item_idx)
+                        .unwrap_or(0);
+                    self.ui.selected_item = visible_idx;
                     self.sync_items_list_state();
                     self.ui.mode = super::Mode::Normal;
                     self.ui.panel = super::Panel::Items;
@@ -73,14 +79,12 @@ impl App {
                         (self.ui.search_selected + 1) % self.ui.search_results.len();
                 }
             }
-            KeyCode::Up | KeyCode::BackTab => {
-                if !self.ui.search_results.is_empty() {
-                    self.ui.search_selected = self
-                        .ui
-                        .search_selected
-                        .checked_sub(1)
-                        .unwrap_or(self.ui.search_results.len() - 1);
-                }
+            KeyCode::Up | KeyCode::BackTab if !self.ui.search_results.is_empty() => {
+                self.ui.search_selected = self
+                    .ui
+                    .search_selected
+                    .checked_sub(1)
+                    .unwrap_or(self.ui.search_results.len() - 1);
             }
             _ => {}
         }
@@ -128,8 +132,22 @@ impl App {
             // Actions
             KeyCode::Char('r') => {
                 self.ui.set_status("Refreshing feeds...");
-                self.feeds.refresh_all().await;
-                self.ui.set_status("Feeds refreshed!");
+                let refreshed = if self.ui.sync_enabled {
+                    self.ui.syncing = true;
+                    let result = self.run_sync().await;
+                    self.ui.syncing = false;
+                    result
+                } else {
+                    self.feeds.refresh_all().await;
+                    Ok(())
+                };
+                match refreshed {
+                    Ok(()) => {
+                        self.ui.read_this_session.clear();
+                        self.ui.set_status("Feeds refreshed!");
+                    }
+                    Err(error) => self.ui.set_error(format!("Refresh failed: {error}")),
+                }
             }
             KeyCode::Char('o') => self.open_link(),
             KeyCode::Char('s') => self.open_share_dialog(),
@@ -149,6 +167,7 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle_read(),
             KeyCode::Char('a') => self.mark_all_read(),
+            KeyCode::Char('H') => self.toggle_hide_read(),
 
             // Delete feed
             KeyCode::Char('d') | KeyCode::Delete => self.delete_selected_feed(),
@@ -164,10 +183,8 @@ impl App {
             }
 
             // Update (if available)
-            KeyCode::Char('U') => {
-                if self.ui.update_available.is_some() {
-                    self.ui.mode = super::Mode::UpdateConfirm;
-                }
+            KeyCode::Char('U') if self.ui.update_available.is_some() => {
+                self.ui.mode = super::Mode::UpdateConfirm;
             }
 
             _ => {}
@@ -258,14 +275,12 @@ impl App {
                         (self.ui.discovered_feed_index + 1) % self.ui.discovered_feeds.len();
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if !self.ui.discovered_feeds.is_empty() {
-                    self.ui.discovered_feed_index = self
-                        .ui
-                        .discovered_feed_index
-                        .checked_sub(1)
-                        .unwrap_or(self.ui.discovered_feeds.len() - 1);
-                }
+            KeyCode::Char('k') | KeyCode::Up if !self.ui.discovered_feeds.is_empty() => {
+                self.ui.discovered_feed_index = self
+                    .ui
+                    .discovered_feed_index
+                    .checked_sub(1)
+                    .unwrap_or(self.ui.discovered_feeds.len() - 1);
             }
             _ => {}
         }
@@ -483,29 +498,35 @@ impl App {
             return;
         }
 
-        // Push to remote sync server if configured (fire-and-forget)
+        // Push to the account server if configured. Synced accounts never
+        // fetch the source feed directly; the server owns feed retrieval.
         if self.ui.sync_enabled {
-            if let Some(sync) = &self.config.sync {
+            if let Some(sync) = self.config.sync.clone() {
                 if let Some((username, password)) = sync.get_credentials() {
-                    let server = sync.server.clone();
-                    let feed_url = url.clone();
-                    let feed_title = name.clone();
                     let category = folder_name.map(|f| format!("user/-/label/{}", f));
-                    tokio::spawn(async move {
-                        if let Ok(manager) =
-                            crate::sync::SyncManager::connect(&server, &username, &password).await
-                        {
-                            let _ = manager
+                    match crate::sync::SyncManager::connect(&sync.server, &username, &password)
+                        .await
+                    {
+                        Ok(manager) => {
+                            if let Err(error) = manager
                                 .client()
                                 .add_subscription(
                                     manager.auth(),
-                                    &feed_url,
-                                    Some(&feed_title),
+                                    &url,
+                                    Some(&name),
                                     category.as_deref(),
                                 )
-                                .await;
+                                .await
+                            {
+                                self.ui.set_error(format!("Failed to add feed: {error}"));
+                                return;
+                            }
                         }
-                    });
+                        Err(error) => {
+                            self.ui.set_error(format!("Failed to connect: {error}"));
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -521,9 +542,17 @@ impl App {
             }
         }
 
-        // Refresh the newly added feed
-        let feed_idx = self.feeds.feeds.len().saturating_sub(1);
-        self.feeds.refresh_feed(feed_idx).await;
+        if self.ui.sync_enabled {
+            if let Err(error) = self.run_sync().await {
+                self.ui
+                    .set_error(format!("Failed to sync new feed: {error}"));
+                return;
+            }
+        } else {
+            // Local accounts fetch the source directly.
+            let feed_idx = self.feeds.feeds.len().saturating_sub(1);
+            self.feeds.refresh_feed(feed_idx).await;
+        }
 
         // Update UI
         self.rebuild_feed_list();
@@ -821,10 +850,11 @@ impl App {
                 }
             }
             super::Panel::Items => {
-                let item_count = self.current_feed_items().len();
+                let item_count = self.visible_items().len();
                 if self.ui.selected_item < item_count.saturating_sub(1) {
                     self.ui.selected_item += 1;
                     self.sync_items_list_state();
+                    self.mark_current_read();
                 }
             }
             super::Panel::Content => {
@@ -844,6 +874,7 @@ impl App {
             super::Panel::Items => {
                 self.ui.selected_item = self.ui.selected_item.saturating_sub(1);
                 self.sync_items_list_state();
+                self.mark_current_read();
             }
             super::Panel::Content => {
                 self.ui.scroll_offset = self.ui.scroll_offset.saturating_sub(1);
@@ -874,7 +905,7 @@ impl App {
                 self.update_selected_feed();
             }
             super::Panel::Items => {
-                let len = self.current_feed_items().len();
+                let len = self.visible_items().len();
                 self.ui.selected_item = len.saturating_sub(1);
                 self.sync_items_list_state();
             }
@@ -906,7 +937,6 @@ impl App {
                 // Mark item as read when opening
                 self.mark_current_read();
                 self.ui.show_content = true;
-                self.ui.panel = super::Panel::Content;
                 self.ui.scroll_offset = 0;
             }
             super::Panel::Content => {}
@@ -969,31 +999,69 @@ impl App {
     fn toggle_read(&mut self) {
         if matches!(self.ui.panel, super::Panel::Items | super::Panel::Content) {
             if let Some(feed_idx) = self.ui.selected_feed {
-                if let Some(feed) = self.feeds.feeds.get_mut(feed_idx) {
-                    if let Some(item) = feed.items.get_mut(self.ui.selected_item) {
+                // Resolve raw index through the visible (filtered) list
+                let raw_idx = self
+                    .visible_items()
+                    .into_iter()
+                    .nth(self.ui.selected_item)
+                    .map(|(i, _)| i);
+
+                if let (Some(raw_idx), Some(feed)) = (raw_idx, self.feeds.feeds.get_mut(feed_idx)) {
+                    if let Some(item) = feed.items.get_mut(raw_idx) {
+                        let was_read = item.read;
                         item.toggle_read();
                         // Persist to cache
                         let feed_url = feed.url.clone();
                         let item_id = item.id.clone();
                         let is_read = item.read;
-                        self.feeds.cache.set_item_read(&feed_url, &item_id, is_read);
+                        let _ = self.feeds.cache.set_item_read(&feed_url, &item_id, is_read);
                         let _ = self.feeds.cache.save();
+                        // Track read items so they stay visible until next refresh
+                        if is_read {
+                            self.ui.read_this_session.insert(item_id);
+                            if !was_read {
+                                if let Some(sync_id) = &item.sync_id {
+                                    let _ = self.feeds.cache.queue_read_state(sync_id, true);
+                                }
+                            }
+                        } else {
+                            self.ui.read_this_session.remove(&item_id);
+                            if let Some(sync_id) = &item.sync_id {
+                                let _ = self.feeds.cache.queue_read_state(sync_id, false);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    fn mark_current_read(&mut self) {
+    /// Mark the currently selected article as read and persist the change.
+    pub fn mark_current_read(&mut self) {
         if let Some(feed_idx) = self.ui.selected_feed {
-            if let Some(feed) = self.feeds.feeds.get_mut(feed_idx) {
-                if let Some(item) = feed.items.get_mut(self.ui.selected_item) {
+            // Resolve raw index through the visible (filtered) list
+            let raw_idx = self
+                .visible_items()
+                .into_iter()
+                .nth(self.ui.selected_item)
+                .map(|(i, _)| i);
+
+            if let (Some(raw_idx), Some(feed)) = (raw_idx, self.feeds.feeds.get_mut(feed_idx)) {
+                if let Some(item) = feed.items.get_mut(raw_idx) {
+                    let was_read = item.read;
                     item.mark_read();
                     // Persist to cache
                     let feed_url = feed.url.clone();
                     let item_id = item.id.clone();
-                    self.feeds.cache.set_item_read(&feed_url, &item_id, true);
+                    let _ = self.feeds.cache.set_item_read(&feed_url, &item_id, true);
                     let _ = self.feeds.cache.save();
+                    // Track read items so they stay visible until next refresh
+                    self.ui.read_this_session.insert(item_id);
+                    if !was_read {
+                        if let Some(sync_id) = &item.sync_id {
+                            let _ = self.feeds.cache.queue_read_state(sync_id, true);
+                        }
+                    }
                 }
             }
         }
@@ -1002,12 +1070,37 @@ impl App {
     fn mark_all_read(&mut self) {
         if let Some(feed_idx) = self.ui.selected_feed {
             if let Some(feed) = self.feeds.feeds.get_mut(feed_idx) {
+                for sync_id in feed
+                    .items
+                    .iter()
+                    .filter(|item| !item.read)
+                    .filter_map(|item| item.sync_id.as_deref())
+                {
+                    let _ = self.feeds.cache.queue_read_state(sync_id, true);
+                }
                 feed.mark_all_read();
                 // Persist to cache
                 let feed_url = feed.url.clone();
                 self.feeds.cache.mark_feed_read(&feed_url);
                 let _ = self.feeds.cache.save();
             }
+        }
+    }
+
+    fn toggle_hide_read(&mut self) {
+        self.ui.hide_read = !self.ui.hide_read;
+        // Clamp selected_item to the new visible list length
+        let visible_count = self.visible_items().len();
+        if visible_count == 0 {
+            self.ui.selected_item = 0;
+        } else if self.ui.selected_item >= visible_count {
+            self.ui.selected_item = visible_count - 1;
+        }
+        self.sync_items_list_state();
+        if self.ui.hide_read {
+            self.ui.set_status("Hiding read items");
+        } else {
+            self.ui.set_status("Showing all items");
         }
     }
 
@@ -1018,6 +1111,10 @@ impl App {
         if let Some(super::state::FeedListItem::Feed(idx)) =
             self.ui.feed_list.get(self.ui.feed_list_index)
         {
+            // Clear session-read set only when switching to a different feed
+            if self.ui.selected_feed != Some(*idx) {
+                self.ui.read_this_session.clear();
+            }
             self.ui.selected_feed = Some(*idx);
             self.ui.selected_item = 0;
             self.sync_items_list_state();
@@ -1185,4 +1282,101 @@ impl App {
             }
         }
     }
+
+    /// Handle a mouse event.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Only handle mouse in normal mode
+        if self.ui.mode != super::Mode::Normal {
+            return;
+        }
+
+        let x = mouse.column;
+        let y = mouse.row;
+
+        match mouse.kind {
+            // ── Scroll wheel ──────────────────────────────────────────────
+            MouseEventKind::ScrollDown => {
+                if contains(self.ui.feeds_area, x, y) {
+                    self.ui.panel = super::Panel::Feeds;
+                    self.move_down();
+                } else if contains(self.ui.items_area, x, y) {
+                    self.ui.panel = super::Panel::Items;
+                    self.move_down();
+                } else if contains(self.ui.content_area, x, y) {
+                    self.ui.scroll_offset = self.ui.scroll_offset.saturating_add(3);
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if contains(self.ui.feeds_area, x, y) {
+                    self.ui.panel = super::Panel::Feeds;
+                    self.move_up();
+                } else if contains(self.ui.items_area, x, y) {
+                    self.ui.panel = super::Panel::Items;
+                    self.move_up();
+                } else if contains(self.ui.content_area, x, y) {
+                    self.ui.scroll_offset = self.ui.scroll_offset.saturating_sub(3);
+                }
+            }
+
+            // ── Left click ────────────────────────────────────────────────
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(self.ui.feeds_area, x, y) {
+                    self.ui.panel = super::Panel::Feeds;
+                    // Map click y to a feed list index (account for border + padding)
+                    let inner_y = y.saturating_sub(self.ui.feeds_area.y + 1);
+                    let target = inner_y as usize;
+                    if target < self.ui.feed_list.len() {
+                        self.ui.feed_list_index = target;
+                        self.update_selected_feed();
+                    }
+                } else if contains(self.ui.items_area, x, y) {
+                    self.ui.panel = super::Panel::Items;
+                    // Each item may span multiple lines due to wrapping — find which
+                    // item was clicked by walking visible_items and counting rendered lines.
+                    let inner_width = self.ui.items_area.width.saturating_sub(6) as usize;
+                    let click_row = y.saturating_sub(self.ui.items_area.y + 1) as usize;
+                    let visible = self.visible_items();
+                    let mut row = 0usize;
+                    for (vis_idx, (_, item)) in visible.iter().enumerate() {
+                        let line_count = wrapped_line_count(&item.title, inner_width).max(1);
+                        if click_row < row + line_count {
+                            self.ui.selected_item = vis_idx;
+                            self.sync_items_list_state();
+                            break;
+                        }
+                        row += line_count;
+                    }
+                } else if contains(self.ui.content_area, x, y) {
+                    self.ui.panel = super::Panel::Content;
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// Returns true if (x, y) falls within `area`.
+fn contains(area: ratatui::layout::Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+/// Count how many terminal lines a title occupies when wrapped at `width`.
+fn wrapped_line_count(title: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut lines = 1usize;
+    let mut current = 0usize;
+    for word in title.split_whitespace() {
+        if current == 0 {
+            current = word.len();
+        } else if current + 1 + word.len() <= width {
+            current += 1 + word.len();
+        } else {
+            lines += 1;
+            current = word.len();
+        }
+    }
+    lines
 }

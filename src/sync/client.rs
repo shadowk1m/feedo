@@ -589,6 +589,15 @@ impl StreamOptions {
         }
     }
 
+    /// Create options for fetching up to `count` unread items.
+    pub fn unread_with_count(count: u32) -> Self {
+        Self {
+            count: Some(count),
+            unread_only: true,
+            ..Default::default()
+        }
+    }
+
     /// Create options with a count limit.
     pub fn with_count(count: u32) -> Self {
         Self {

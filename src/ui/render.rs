@@ -2,7 +2,7 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap},
 };
 
 use super::state::FeedListItem;
@@ -158,6 +158,11 @@ impl App {
             .constraints(constraints)
             .split(area);
 
+        // Store areas for mouse hit-testing
+        self.ui.feeds_area = layout[0];
+        self.ui.items_area = layout[1];
+        self.ui.content_area = layout[2];
+
         self.render_feeds_panel(frame, layout[0]);
         self.render_items_panel(frame, layout[1]);
 
@@ -247,6 +252,7 @@ impl App {
                     .borders(Borders::ALL)
                     .border_style(border_style)
                     .border_type(BorderType::Rounded)
+                    .padding(Padding::horizontal(1))
                     .title(" 📡 Feeds "),
             )
             .highlight_symbol("▶ ");
@@ -260,11 +266,14 @@ impl App {
         let accent = self.theme.palette().accent;
         let muted = self.theme.palette().muted;
 
-        let items: Vec<ListItem> = self
-            .current_feed_items()
+        // Inner width available for text (subtract borders + prefix " ● ")
+        let inner_width = area.width.saturating_sub(6) as usize;
+
+        let visible = self.visible_items();
+        let items: Vec<ListItem> = visible
             .iter()
             .enumerate()
-            .map(|(i, item)| {
+            .map(|(i, (_, item))| {
                 let is_selected = i == self.ui.selected_item;
                 let prefix = if item.read { "○" } else { "●" };
 
@@ -276,19 +285,40 @@ impl App {
                     Style::default()
                 };
 
-                // Truncate title to fit (use chars() for Unicode safety)
-                let max_width = area.width.saturating_sub(6) as usize;
-                let title: String = if item.title.chars().count() > max_width {
-                    item.title
-                        .chars()
-                        .take(max_width.saturating_sub(1))
-                        .chain(std::iter::once('…'))
-                        .collect()
-                } else {
-                    item.title.clone()
-                };
-
-                ListItem::new(format!(" {prefix} {title}")).style(style)
+                // Wrap title across multiple lines
+                let words = item.title.split_whitespace();
+                let mut lines: Vec<Line> = Vec::new();
+                let mut current = String::new();
+                let mut first_line = true;
+                for word in words {
+                    if current.is_empty() {
+                        current.push_str(word);
+                    } else if current.len() + 1 + word.len() <= inner_width {
+                        current.push(' ');
+                        current.push_str(word);
+                    } else {
+                        let text = if first_line {
+                            first_line = false;
+                            format!(" {prefix} {current}")
+                        } else {
+                            format!("   {current}")
+                        };
+                        lines.push(Line::from(text).style(style));
+                        current = word.to_string();
+                    }
+                }
+                if !current.is_empty() {
+                    let text = if first_line {
+                        format!(" {prefix} {current}")
+                    } else {
+                        format!("   {current}")
+                    };
+                    lines.push(Line::from(text).style(style));
+                }
+                if lines.is_empty() {
+                    lines.push(Line::from(format!(" {prefix} ")).style(style));
+                }
+                ListItem::new(Text::from(lines))
             })
             .collect();
 
@@ -298,11 +328,17 @@ impl App {
             Style::default().fg(muted)
         };
 
-        let title = self
+        let feed_name = self
             .ui
             .selected_feed
             .and_then(|idx| self.feeds.feeds.get(idx))
             .map_or(" Articles ", |f| &f.name);
+
+        let title = if self.ui.hide_read {
+            format!(" 📰 {feed_name} [unread only] ")
+        } else {
+            format!(" 📰 {feed_name} ")
+        };
 
         let list = List::new(items)
             .block(
@@ -310,7 +346,8 @@ impl App {
                     .borders(Borders::ALL)
                     .border_style(border_style)
                     .border_type(BorderType::Rounded)
-                    .title(format!(" 📰 {title} ")),
+                    .padding(Padding::horizontal(1))
+                    .title(title),
             )
             .highlight_symbol("▶ ");
 
@@ -319,33 +356,42 @@ impl App {
     }
 
     fn render_content_panel(&self, frame: &mut Frame, area: Rect) {
-        use std::fmt::Write;
-
         let is_active = self.ui.panel == Panel::Content;
         let accent = self.theme.palette().accent;
         let muted = self.theme.palette().muted;
 
-        let content = self.selected_item().map_or_else(
-            || format!("\n\n    {DOG_ICON}\n\n    Select an article to read"),
+        let content: Text = self.selected_item().map_or_else(
+            || {
+                Text::raw(format!(
+                    "\n\n    {DOG_ICON}\n\n    Select an article to read"
+                ))
+            },
             |item| {
-                let mut text = format!("  {}\n\n", item.title);
+                let mut lines: Vec<Line> = Vec::new();
+
+                // Title — bold, accent colour
+                lines.push(Line::from(Span::styled(
+                    item.title.clone(),
+                    Style::default().fg(accent).bold(),
+                )));
+                lines.push(Line::raw(""));
 
                 if let Some(date) = item.published {
-                    let _ = write!(text, "  📅 {}\n\n", date.format("%Y-%m-%d %H:%M"));
+                    lines.push(Line::from(Span::styled(
+                        format!("📅 {}", date.format("%Y-%m-%d %H:%M")),
+                        Style::default().fg(muted),
+                    )));
+                    lines.push(Line::raw(""));
                 }
 
                 if let Some(summary) = &item.summary {
-                    // Strip HTML tags
                     let clean = strip_html(summary);
-                    text.push_str("  ");
-                    text.push_str(&clean.replace('\n', "\n  "));
+                    for line in clean.lines() {
+                        lines.push(Line::raw(line.to_string()));
+                    }
                 }
 
-                if let Some(link) = &item.link {
-                    let _ = write!(text, "\n\n  🔗 {link}");
-                }
-
-                text
+                Text::from(lines)
             },
         );
 
@@ -361,6 +407,7 @@ impl App {
                     .borders(Borders::ALL)
                     .border_style(border_style)
                     .border_type(BorderType::Rounded)
+                    .padding(Padding::proportional(1))
                     .title(" 📖 Content "),
             )
             .wrap(Wrap { trim: false })
@@ -1197,6 +1244,13 @@ impl App {
                 Span::styled("]", bracket_style),
                 Span::raw("    "),
                 Span::styled("Mark all read", desc_style),
+            ]),
+            Line::from(vec![
+                Span::styled("  [", bracket_style),
+                Span::styled("H", key_style),
+                Span::styled("]", bracket_style),
+                Span::raw("    "),
+                Span::styled("Toggle hide read", desc_style),
             ]),
             Line::from(vec![
                 Span::styled("  [", bracket_style),

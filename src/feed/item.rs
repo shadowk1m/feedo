@@ -8,6 +8,9 @@ pub struct FeedItem {
     /// Unique ID (for cache matching).
     pub id: String,
 
+    /// Item ID assigned by a synchronization server.
+    pub sync_id: Option<String>,
+
     /// Article title.
     pub title: String,
 
@@ -31,6 +34,7 @@ impl FeedItem {
         let id = Self::generate_id(None, &title);
         Self {
             id,
+            sync_id: None,
             title,
             link: None,
             published: None,
@@ -45,6 +49,7 @@ impl FeedItem {
         let id = Self::generate_id(link.as_deref(), &title);
         Self {
             id,
+            sync_id: None,
             title,
             link,
             published: None,

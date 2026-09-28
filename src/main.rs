@@ -199,7 +199,7 @@ fn print_version() {
 }
 
 async fn run_tui() -> Result<()> {
-    let mut app = App::new().await?;
+    let mut app = App::new()?;
     app.run().await
 }
 
