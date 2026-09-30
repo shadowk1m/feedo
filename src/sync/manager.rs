@@ -23,6 +23,13 @@ fn find_local_item<'a>(
     items: &'a [CachedItem],
     server_item: &StreamItem,
 ) -> Option<&'a CachedItem> {
+    if let Some(item) = items
+        .iter()
+        .find(|item| item.sync_id.as_deref() == Some(server_item.id.as_str()))
+    {
+        return Some(item);
+    }
+
     for link in server_item.links() {
         let id = CachedItem::generate_id(Some(link), server_item.title.as_deref().unwrap_or(""));
         if let Some(item) = items.iter().find(|item| item.id == id) {
@@ -281,12 +288,12 @@ impl SyncManager {
                 let link = local_match
                     .and_then(|local| local.link.clone())
                     .or_else(|| item.links().next().map(str::to_string));
-                let id = local_match.map_or_else(
-                    || CachedItem::generate_id(link.as_deref(), &title),
-                    |local| local.id.clone(),
-                );
                 synced_items.push(CachedItem {
-                    id,
+                    // Reader API IDs are stable and unique within the account.
+                    // URLs are not: multiple articles may intentionally share
+                    // one canonical URL, so hashing links can violate the
+                    // database primary key.
+                    id: item.id.clone(),
                     sync_id: Some(item.id.clone()),
                     title,
                     link,
@@ -439,5 +446,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(find_local_item(&[local], &server).unwrap().title, "Article");
+    }
+
+    #[test]
+    fn matches_authoritative_server_id_before_url() {
+        let mut local = cached_item("Old title", "https://example.com/shared", 100);
+        local.sync_id = Some("server-id".to_string());
+        let server: StreamItem = serde_json::from_value(json!({
+            "id": "server-id",
+            "title": "New title",
+            "published": 999,
+            "canonical": [{"href": "https://example.com/different"}]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            find_local_item(&[local], &server).unwrap().title,
+            "Old title"
+        );
     }
 }

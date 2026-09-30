@@ -137,7 +137,8 @@ impl App {
     }
 
     fn render_content(&mut self, frame: &mut Frame, area: Rect) {
-        let constraints = if self.ui.show_content {
+        let show_content = self.ui.show_content && self.ui.panel != Panel::Feeds;
+        let constraints = if show_content {
             [
                 Constraint::Percentage(20),
                 Constraint::Percentage(30),
@@ -166,7 +167,7 @@ impl App {
         self.render_feeds_panel(frame, layout[0]);
         self.render_items_panel(frame, layout[1]);
 
-        if self.ui.show_content {
+        if show_content {
             self.render_content_panel(frame, layout[2]);
         }
     }
