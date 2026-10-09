@@ -843,7 +843,9 @@ impl App {
                 if self.ui.selected_item < item_count.saturating_sub(1) {
                     self.ui.selected_item += 1;
                     self.sync_items_list_state();
-                    self.mark_current_read();
+                    if self.ui.show_content {
+                        self.mark_current_read();
+                    }
                 }
             }
             super::Panel::Content => {
@@ -863,7 +865,9 @@ impl App {
             super::Panel::Items => {
                 self.ui.selected_item = self.ui.selected_item.saturating_sub(1);
                 self.sync_items_list_state();
-                self.mark_current_read();
+                if self.ui.show_content {
+                    self.mark_current_read();
+                }
             }
             super::Panel::Content => {
                 self.ui.scroll_offset = self.ui.scroll_offset.saturating_sub(1);
@@ -923,10 +927,10 @@ impl App {
                 }
             }
             super::Panel::Items => {
-                // Mark item as read when opening
-                self.mark_current_read();
                 self.ui.show_content = true;
                 self.ui.scroll_offset = 0;
+                // Mark as read only now that the content pane is visible
+                self.mark_current_read();
             }
             super::Panel::Content => {}
         }

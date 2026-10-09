@@ -132,9 +132,25 @@ impl App {
         // RSS fetching is reserved for local-only accounts.
         let mut needs_initial_refresh = self.ui.refreshing && !self.ui.sync_enabled;
         let mut update_check_done = false;
+        let sync_interval = (self.config.refresh_interval > 0).then(|| {
+            Duration::from_secs(u64::from(self.config.refresh_interval).saturating_mul(60))
+        });
+        let mut next_regular_sync =
+            sync_interval.map(|interval| std::time::Instant::now() + interval);
 
         loop {
             self.finish_sync_if_ready().await;
+
+            if self.ui.sync_enabled
+                && !self.ui.syncing
+                && next_regular_sync.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                if let Err(error) = self.start_sync() {
+                    self.ui.set_error(format!("Scheduled sync failed: {error}"));
+                }
+                next_regular_sync =
+                    sync_interval.map(|interval| std::time::Instant::now() + interval);
+            }
 
             // Render
             terminal.draw(|frame| self.render(frame))?;
@@ -158,8 +174,9 @@ impl App {
                                 }
                                 crate::ui::input::KeyResult::Continue => {}
                             }
-                            // Mark current item read whenever content is visible
-                            if self.ui.show_content {
+                            // Mark current item read only when the content pane
+                            // is actually visible (not hidden by Feeds focus).
+                            if self.ui.show_content && self.ui.panel != crate::ui::Panel::Feeds {
                                 self.mark_current_read();
                             }
                         }
