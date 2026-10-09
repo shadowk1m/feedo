@@ -844,6 +844,7 @@ impl App {
                     self.ui.selected_item += 1;
                     self.sync_items_list_state();
                     if self.ui.show_content {
+                        self.ui.scroll_offset = 0;
                         self.mark_current_read();
                     }
                 }
@@ -863,10 +864,13 @@ impl App {
                 }
             }
             super::Panel::Items => {
-                self.ui.selected_item = self.ui.selected_item.saturating_sub(1);
-                self.sync_items_list_state();
-                if self.ui.show_content {
-                    self.mark_current_read();
+                if self.ui.selected_item > 0 {
+                    self.ui.selected_item = self.ui.selected_item.saturating_sub(1);
+                    self.sync_items_list_state();
+                    if self.ui.show_content {
+                        self.ui.scroll_offset = 0;
+                        self.mark_current_read();
+                    }
                 }
             }
             super::Panel::Content => {
@@ -884,6 +888,10 @@ impl App {
             super::Panel::Items => {
                 self.ui.selected_item = 0;
                 self.sync_items_list_state();
+                if self.ui.show_content {
+                    self.ui.scroll_offset = 0;
+                    self.mark_current_read();
+                }
             }
             super::Panel::Content => {
                 self.ui.scroll_offset = 0;
@@ -901,6 +909,10 @@ impl App {
                 let len = self.visible_items().len();
                 self.ui.selected_item = len.saturating_sub(1);
                 self.sync_items_list_state();
+                if self.ui.show_content {
+                    self.ui.scroll_offset = 0;
+                    self.mark_current_read();
+                }
             }
             super::Panel::Content => {
                 self.ui.scroll_offset = u16::MAX;
